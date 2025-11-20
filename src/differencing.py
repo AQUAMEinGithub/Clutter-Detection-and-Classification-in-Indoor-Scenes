@@ -1,49 +1,88 @@
 import cv2
 import numpy as np
 
-def extract_sift_features(image):
-    # SIFT keypoints + descriptors
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    sift = cv2.SIFT_create()
-    kp, desc = sift.detectAndCompute(gray, None)
-    return kp, desc
+def compute_difference_mask(aligned_tidy, cluttered):
+    """
+        Compute the raw pixel-wise difference between the aligned tidy image
+        and the cluttered image.
 
+        Parameters
+        ----------
+        aligned_tidy : np.ndarray
+            Tidy image warped into cluttered coordinate frame.
+        cluttered : np.ndarray
+            Original cluttered image.
 
-def match_features(desc1, desc2, ratio=0.75):
-    # FLANN + Lowe’s ratio test
-    index_params = dict(algorithm=1, trees=5)
-    search_params = dict(checks=50)
-    flann = cv2.FlannBasedMatcher(index_params, search_params)
+        Returns
+        -------
+        diff_gray : np.ndarray
+            Grayscale absolute-difference map highlighting changed regions.
+        """
+    diff = cv2.absdiff(aligned_tidy, cluttered)
+    diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    diff_gray = cv2.GaussianBlur(diff_gray, (5, 5), 0)
+    return diff_gray
 
-    matches = flann.knnMatch(desc1, desc2, k=2)
-    good = [m for m, n in matches if m.distance < ratio * n.distance]
-    return good
+def threshold_mask(diff_gray, thresh=20):
+    """
+    Threshold the grayscale difference map to obtain a binary foreground mask.
 
+    Parameters
+    ----------
+    diff_gray : np.ndarray
+        Raw grayscale difference image.
+    thresh : int, optional
+        Threshold for binarization.
 
-def estimate_homography(kp1, kp2, matches, thresh=4.0):
-    # Compute homography with RANSAC
-    if len(matches) < 4:
-        return None, None
+    Returns
+    -------
+    mask : np.ndarray
+        Binary mask where changed pixels = 255.
+    """
+    _, mask = cv2.threshold(diff_gray, thresh, 255, cv2.THRESH_BINARY)
+    return mask
 
-    pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
-    pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
+def clean_mask(mask):
+    """
+    Refine the binary difference mask using morphological operations.
 
-    H, mask = cv2.findHomography(pts1, pts2, cv2.RANSAC, thresh)
-    return H, mask
+    Parameters
+    ----------
+    mask : np.ndarray
+        Binary mask from thresholding.
 
+    Returns
+    -------
+    cleaned : np.ndarray
+        Noise-reduced and hole-filled mask suitable for region extraction.
 
-def align_images(tidy_image, cluttered_image):
-    # Full alignment pipeline
-    kp1, desc1 = extract_sift_features(tidy_image)
-    kp2, desc2 = extract_sift_features(cluttered_image)
+    Notes
+    -----
+    Uses morphological opening to remove small noise
+    and closing to merge fragmented regions.
+    """
+    kernel = np.ones((5,5), np.uint8)
+    cleaned = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+    return cleaned
 
-    matches = match_features(desc1, desc2)
-    H, mask = estimate_homography(kp1, kp2, matches)
+def extract_bounding_boxes(mask):
+    """
+    Extract bounding boxes around connected components in the mask.
 
-    if H is None:
-        print("Homography failed.")
-        return None, None, matches
+    Parameters
+    ----------
+    mask : np.ndarray
+        Cleaned binary mask representing changed regions.
 
-    h, w = cluttered_image.shape[:2]
-    aligned = cv2.warpPerspective(tidy_image, H, (w, h))
-    return aligned, H, matche
+    Returns
+    -------
+    boxes : list of tuples
+        List of bounding boxes in the format (x, y, w, h) for each region.
+    """
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    for c in contours:
+        x,y,w,h = cv2.boundingRect(c)
+        boxes.append((x,y,w,h))
+    return boxes
